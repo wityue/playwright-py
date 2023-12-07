@@ -1,2 +1,2 @@
-def test_example(browser):
-    browser.new_context()
+def test_example(playwright):
+    print(playwright)

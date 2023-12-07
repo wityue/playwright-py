@@ -1,4 +1,5 @@
 import pytest
+import sys
 from playwright.sync_api import (
     Browser,
     BrowserType,
@@ -10,44 +11,156 @@ from playwright.sync_api import (
 )
 from typing import Any, Callable, Dict, Generator, List, Optional
 
+#
+# @pytest.fixture(scope="session")
+# def browser_context_args(
+#     pytestconfig: Any,
+#     playwright: Playwright,
+#     device: Optional[str],
+#     base_url: Optional[str],
+# ) -> Dict:
+#     context_args = {}
+#     if device:
+#         context_args.update(playwright.devices[device])
+#     if base_url:
+#         context_args["base_url"] = base_url
+#
+#     video_option = pytestconfig.getoption("--video")
+#     capture_video = video_option in ["on", "retain-on-failure"]
+#     if capture_video:
+#         context_args["record_video_dir"] = artifacts_folder.name
+#
+#     return context_args
+
 
 @pytest.fixture(scope="session")
-def playwright(pytestconfig) -> Generator[Playwright, None, None]:
-    test_id = pytestconfig.getoption("--output")
+def is_webkit(browser_name: str) -> bool:
+    return browser_name == "webkit"
+
+
+@pytest.fixture(scope="session")
+def is_firefox(browser_name: str) -> bool:
+    return browser_name == "firefox"
+
+
+@pytest.fixture(scope="session")
+def is_chromium(browser_name: str) -> bool:
+    return browser_name == "chromium"
+
+
+@pytest.fixture(scope="session")
+def browser_name(pytestconfig: Any) -> Optional[str]:
+    # When using unittest.TestCase it won't use pytest_generate_tests
+    # For that we still try to give the user a slightly less feature-rich experience
+    yield pytestconfig.getoption("--browser")
+
+
+@pytest.fixture(scope="session")
+def browser(pytestconfig,
+            browser_name,
+            browser_type_launch_args) -> Generator[Browser, None, None]:
+    test_id = pytestconfig.getoption("--testIdAttribute")
     pw = sync_playwright().start()
     if test_id:
         pw.selectors.set_test_id_attribute(test_id)
-    yield pw
+    browser_launch_options = {}
+    headed_option = pytestconfig.getoption("--headed")
+    if headed_option:
+        browser_launch_options["headless"] = False
+    elif sys.gettrace():
+        # When debugger is attached, then launch the browser headed by default
+        browser_launch_options["headless"] = False
+    slowmo_option = pytestconfig.getoption("--slowmo")
+    if slowmo_option:
+        browser_launch_options["slow_mo"] = slowmo_option
+    browser = getattr(pw, browser_name).launch(**browser_type_launch_args)
+    yield browser
+    browser.close()
     pw.stop()
 
 
-@pytest.fixture(scope="session")
-def browser_type(playwright: Playwright, browser_name: str) -> BrowserType:
-    return getattr(playwright, browser_name)
+@pytest.fixture
+def context(
+    browser: Browser,
+    browser_context_args: Dict,
+    pytestconfig: Any,
+    request: pytest.FixtureRequest,
+) -> Generator[BrowserContext, None, None]:
+    pages: List[Page] = []
 
+    browser_context_args = browser_context_args.copy()
+    context_args_marker = next(request.node.iter_markers("browser_context_args"), None)
+    additional_context_args = context_args_marker.kwargs if context_args_marker else {}
+    browser_context_args.update(additional_context_args)
 
-@pytest.fixture(scope="session")
-def launch_browser(
-        browser_type_launch_args: Dict,
-        browser_type: BrowserType
-) -> Callable[..., Browser]:
-    def launch(**kwargs: Dict) -> Browser:
-        launch_options = {**browser_type_launch_args, **kwargs}
-        browser = browser_type.launch(**launch_options)
-        return browser
+    context = browser.new_context(**browser_context_args)
+    context.on("page", lambda page: pages.append(page))
 
-    return launch
+    tracing_option = pytestconfig.getoption("--tracing")
+    capture_trace = tracing_option in ["on", "retain-on-failure"]
+    if capture_trace:
+        context.tracing.start(
+            title=slugify(request.node.nodeid),
+            screenshots=True,
+            snapshots=True,
+            sources=True,
+        )
 
+    yield context
 
-@pytest.fixture(scope="session")
-def browser(launch_browser: Callable[[], Browser]) -> Generator[Browser, None, None]:
-    browser = launch_browser()
-    yield browser
-    browser.close()
+    # If request.node is missing rep_call, then some error happened during execution
+    # that prevented teardown, but should still be counted as a failure
+    failed = request.node.rep_call.failed if hasattr(request.node, "rep_call") else True
 
+    if capture_trace:
+        retain_trace = tracing_option == "on" or (
+            failed and tracing_option == "retain-on-failure"
+        )
+        if retain_trace:
+            trace_path = _build_artifact_test_folder(pytestconfig, request, "trace.zip")
+            context.tracing.stop(path=trace_path)
+        else:
+            context.tracing.stop()
 
-def context_generator(browser):
-    ...
+    screenshot_option = pytestconfig.getoption("--screenshot")
+    capture_screenshot = screenshot_option == "on" or (
+        failed and screenshot_option == "only-on-failure"
+    )
+    if capture_screenshot:
+        for index, page in enumerate(pages):
+            human_readable_status = "failed" if failed else "finished"
+            screenshot_path = _build_artifact_test_folder(
+                pytestconfig, request, f"test-{human_readable_status}-{index+1}.png"
+            )
+            try:
+                page.screenshot(
+                    timeout=5000,
+                    path=screenshot_path,
+                    full_page=pytestconfig.getoption("--full-page-screenshot"),
+                )
+            except Error:
+                pass
+
+    context.close()
+
+    video_option = pytestconfig.getoption("--video")
+    preserve_video = video_option == "on" or (
+        failed and video_option == "retain-on-failure"
+    )
+    if preserve_video:
+        for page in pages:
+            video = page.video
+            if not video:
+                continue
+            try:
+                video_path = video.path()
+                file_name = os.path.basename(video_path)
+                video.save_as(
+                    path=_build_artifact_test_folder(pytestconfig, request, file_name)
+                )
+            except Error:
+                # Silent catch empty videos.
+                pass
 
 
 def pytest_addoption(parser: Any) -> None:
@@ -58,8 +171,7 @@ def pytest_addoption(parser: Any) -> None:
     )
     group.addoption(
         "--browser",
-        action="append",
-        default=["chromium"],
+        default="chromium",
         help="指定用例执行所使用浏览器.",
         choices=["chromium", "firefox", "webkit"],
     )
@@ -81,7 +193,6 @@ def pytest_addoption(parser: Any) -> None:
         "--testIdAttribute",
         help="自定义test id.\n"
              "https://playwright.dev/python/docs/api/class-selectors#selectors-set-test-id-attribute",
-        default="data-tester-id",
         type=str
     )
     group.addoption(
@@ -102,7 +213,7 @@ def pytest_addoption(parser: Any) -> None:
         help="存储video等playwright临时文件的目录.",
     )
     group.addoption(
-        "--trace",
+        "--tracing",
         default="off",
         choices=["on", "off", "retain-on-failure"],
         help="是否生成tracing.",
